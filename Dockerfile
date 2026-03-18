@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
         "uvicorn[standard]==0.30.0" \
         pydantic==2.7.0 \
         pydantic-settings==2.3.0 \
+        rich==13.7.1 \
         firebase-admin==6.5.0 \
         boto3==1.35.0 \
         python-dotenv==1.0.1 \
