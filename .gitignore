@@ -1,0 +1,59 @@
+# firebase credentials
+firebase-credentials.json
+
+
+# --- Byte-compiled / optimized / DLLs ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C-extensions / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Django / Flask / local settings ---
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.nox/
+coverage.xml
+
+# --- Type checking / linting caches ---
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# --- Packaging / wheels ---
+*.whl
+wheelhouse/
+
+# --- Jupyter / notebooks ---
+.ipynb_checkpoints/
+
+# --- Environment variables / secrets ---
+.env
+.env.*
+!.env.example
+!.env.example.*
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.iml
+.DS_Store

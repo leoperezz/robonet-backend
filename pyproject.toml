@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robonet-backend"
+version = "0.1.0"
+description = "Backend para streaming de video e IMU — Robonet POC"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.30.0",
+    "pydantic==2.7.0",
+    "pydantic-settings==2.3.0",
+    "rich==13.7.1",
+    # Firebase
+    "firebase-admin==6.5.0",
+    # AWS/R2 SDK (R2 es S3-compatible)
+    "boto3==1.35.0",
+    # Utilidades
+    "python-dotenv==1.0.1",
+    "python-jose[cryptography]==3.3.0",
+    "httpx==0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.0",
+    "pytest-asyncio==0.23.8",
+    "httpx==0.27.0",
+    "ruff==0.5.0",
+    "mypy==1.11.0",
+]
+
+[project.scripts]
+serve = "app.main:start"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ─── Ruff (linter + formatter) ────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+# ─── Mypy ─────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+
+# ─── Pytest ───────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
