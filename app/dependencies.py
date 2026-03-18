@@ -2,7 +2,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.services.firebase import verify_token
-from logger import get_logger
+from app.logger import get_logger
 
 security = HTTPBearer()
 logger = get_logger(__name__)

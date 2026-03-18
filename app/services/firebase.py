@@ -12,7 +12,7 @@ from firebase_admin import auth as firebase_auth
 from firebase_admin import credentials, firestore
 
 from app.config import get_settings
-from logger import get_logger
+from app.logger import get_logger
 
 logger = get_logger(__name__)
 

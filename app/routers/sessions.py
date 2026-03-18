@@ -7,7 +7,7 @@ from app.dependencies import get_current_user
 from app.models.session import CreateSessionRequest, SessionResponse
 from app.services.firebase import get_db
 from app.services.r2 import create_multipart_upload
-from logger import get_logger
+from app.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)

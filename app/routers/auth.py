@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends
 from app.dependencies import get_current_user
 from app.models.user import RegisterDeviceRequest, UserResponse
 from app.services.firebase import get_db
-from logger import get_logger
+from app.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)

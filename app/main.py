@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.routers import auth, sessions, uploads
 from app.services.firebase import init_firebase
-from logger import get_logger, setup_logging
+from app.logger import get_logger, setup_logging
 
 def create_app() -> FastAPI:
     """

@@ -16,7 +16,7 @@ from app.services.r2 import (
     complete_multipart_upload,
     generate_presigned_part_url,
 )
-from logger import get_logger
+from app.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)

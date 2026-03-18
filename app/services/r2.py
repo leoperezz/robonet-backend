@@ -13,7 +13,7 @@ import boto3
 from botocore.config import Config
 
 from app.config import Settings, get_settings
-from logger import get_logger
+from app.logger import get_logger
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
