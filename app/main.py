@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import auth, sessions, uploads
+from app.routers import auth, sessions, uploads, sync_signals
 from app.services.firebase import init_firebase
 from app.logger import get_logger, setup_logging
 
@@ -47,6 +47,7 @@ def create_app() -> FastAPI:
     fastapi_app.include_router(auth.router, prefix="/auth", tags=["auth"])
     fastapi_app.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
     fastapi_app.include_router(uploads.router, prefix="/sessions", tags=["uploads"])
+    fastapi_app.include_router(sync_signals.router, prefix="/sessions", tags=["sync"])
 
     @fastapi_app.get("/health", tags=["health"])
     async def health() -> dict:

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -42,8 +43,8 @@ async def presign_chunk(
     user: dict = Depends(get_current_user),
 ) -> PresignResponse:
     """
-    Genera presigned URLs para subir una parte (chunk) del video y del IMU.
-    El móvil hace PUT directo a R2 ��� los datos nunca pasan por el backend.
+    Genera presigned URL para subir una parte (chunk) de `video` o `imu`.
+    El cliente hace PUT directo a R2; los datos nunca pasan por el backend.
     """
     db = get_db()
     session = _get_session_or_raise(db, session_id, user["uid"])
@@ -54,24 +55,23 @@ async def presign_chunk(
             detail=f"La sesión está en estado '{session['status']}', no se puede grabar.",
         )
 
-    video_upload_id = session["videoUpload"]["uploadId"]
-    imu_upload_id = session["imuUpload"]["uploadId"]
+    if body.stream == "video":
+        upload_id = session["videoUpload"]["uploadId"]
+        key = session["videoKey"]
+    else:
+        upload_id = session["imuUpload"]["uploadId"]
+        key = session["imuKey"]
 
-    video_url = generate_presigned_part_url(session["videoKey"], video_upload_id, body.partNumber)
-    imu_url = generate_presigned_part_url(session["imuKey"], imu_upload_id, body.partNumber)
+    presigned_url = generate_presigned_part_url(key, upload_id, body.partNumber)
     logger.info(
-        "Presign chunk: sessionId=%s uid=%s part=%s",
+        "Presign chunk: sessionId=%s uid=%s stream=%s part=%s",
         session_id,
         user["uid"],
+        body.stream,
         body.partNumber,
     )
 
-    return PresignResponse(
-        uploadId=video_upload_id,
-        videoPresignedUrl=video_url,
-        imuPresignedUrl=imu_url,
-        partNumber=body.partNumber,
-    )
+    return PresignResponse(uploadId=upload_id, presignedUrl=presigned_url, partNumber=body.partNumber, stream=body.stream)
 
 
 @router.post("/{session_id}/chunks/confirm", response_model=ConfirmChunkResponse)
@@ -81,27 +81,102 @@ async def confirm_chunk(
     user: dict = Depends(get_current_user),
 ) -> ConfirmChunkResponse:
     """
-    Confirma que un chunk fue subido exitosamente a R2.
-    Guarda el ETag de video e IMU en Firestore para el ensamblado final.
+    Confirma que un chunk fue subido exitosamente a R2 (para `video` o `imu`).
+
+    El backend persiste el receipt en Firestore en `chunks/{chunkId}` y
+    cuando ambos receipts existen marca `status="readyForProcess"`.
     """
     db = get_db()
     _get_session_or_raise(db, session_id, user["uid"])
 
     chunk_id = f"{session_id}_part{body.partNumber:03d}"
-    db.collection("chunks").document(chunk_id).set(
-        {
-            "chunkId": chunk_id,
-            "sessionId": session_id,
-            "partNumber": body.partNumber,
-            "videoETag": body.videoETag,
-            "imuETag": body.imuETag,
-            "uploadedAt": datetime.now(tz=timezone.utc),
-            "status": "uploaded",
-        }
-    )
-    logger.info("Chunk confirmed: sessionId=%s uid=%s part=%s", session_id, user["uid"], body.partNumber)
+    chunk_ref = db.collection("chunks").document(chunk_id)
+    existing_doc = chunk_ref.get()
+    existing = existing_doc.to_dict() if existing_doc.exists else {}
 
-    return ConfirmChunkResponse(chunkId=chunk_id, status="confirmed")
+    now = datetime.now(tz=timezone.utc)
+    payload: dict = {
+        "chunkId": chunk_id,
+        "sessionId": session_id,
+        "partNumber": body.partNumber,
+    }
+
+    if body.stream == "video":
+        payload.update(
+            {
+                "videoETag": body.etag,
+                "videoStartTsUs": body.startTsUs,
+                "videoEndTsUs": body.endTsUs,
+                "videoUploadedAt": now,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "imuETag": body.etag,
+                "imuStartTsUs": body.startTsUs,
+                "imuEndTsUs": body.endTsUs,
+                "sensorIds": body.sensorIds or [],
+                "imuUploadedAt": now,
+            }
+        )
+
+    # Determine ready status after this update.
+    video_ready = ("videoETag" in existing and existing.get("videoETag")) or (
+        body.stream == "video" and body.etag
+    )
+    imu_ready = ("imuETag" in existing and existing.get("imuETag")) or (
+        body.stream == "imu" and body.etag
+    )
+    if video_ready and imu_ready:
+        status = "readyForProcess"
+    elif body.stream == "video":
+        status = "videoUploaded"
+    else:
+        status = "imuUploaded"
+
+    payload["status"] = status
+    chunk_ref.set(payload, merge=True)
+
+    if status == "readyForProcess":
+        # Prototipo de cola para el worker Python/ingest-worker.
+        # Cuando exista Redis se reemplaza por XADD.
+        db.collection("processingQueue").document(chunk_id).set(
+            {
+                "chunkId": chunk_id,
+                "sessionId": session_id,
+                "partNumber": body.partNumber,
+                "createdAt": now,
+                "status": "queued",
+            },
+            merge=True,
+        )
+
+    logger.info(
+        "Chunk confirmed: sessionId=%s uid=%s stream=%s part=%s status=%s",
+        session_id,
+        user["uid"],
+        body.stream,
+        body.partNumber,
+        status,
+    )
+
+    return ConfirmChunkResponse(chunkId=chunk_id, status=status)
+
+
+@router.get("/{session_id}/chunks", response_model=list[dict[str, Any]])
+async def list_chunks(session_id: str, user: dict = Depends(get_current_user)) -> list[dict[str, Any]]:
+    """Devuelve los receipts confirmados por `partNumber` para una sesión."""
+    db = get_db()
+    _get_session_or_raise(db, session_id, user["uid"])
+
+    chunks_docs = (
+        db.collection("chunks")
+        .where("sessionId", "==", session_id)
+        .order_by("partNumber")
+        .stream()
+    )
+    return [doc.to_dict() for doc in chunks_docs]
 
 
 @router.post("/{session_id}/complete", response_model=CompleteSessionResponse)
@@ -126,7 +201,20 @@ async def complete_session(
 
     if not chunks:
         raise HTTPException(status_code=400, detail="No hay chunks confirmados para esta sesión")
-    logger.info("Completing session: sessionId=%s uid=%s chunks=%s", session_id, user["uid"], len(chunks))
+    logger.info(
+        "Completing session: sessionId=%s uid=%s chunks=%s",
+        session_id,
+        user["uid"],
+        len(chunks),
+    )
+
+    missing_video = [c["partNumber"] for c in chunks if not c.get("videoETag")]
+    missing_imu = [c["partNumber"] for c in chunks if not c.get("imuETag")]
+    if missing_video or missing_imu:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Faltan receipts antes de completar. video_missing={missing_video} imu_missing={missing_imu}",
+        )
 
     video_parts = [{"PartNumber": c["partNumber"], "ETag": c["videoETag"]} for c in chunks]
     imu_parts = [{"PartNumber": c["partNumber"], "ETag": c["imuETag"]} for c in chunks]

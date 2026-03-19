@@ -1,12 +1,15 @@
-## Informe técnico: Backend Robonet (Video + IMU Streaming)
+## Informe técnico: Backend Robonet (video por chunks + SyncMeta)
 
-Backend en **Python + FastAPI** que coordina el streaming (por chunks) de **video** (`.mp4`) e **IMU** (`.ndjson`) desde la app móvil hacia:
+Este documento describe cómo el backend FastAPI coordina:
+- **Chunks de video** (multipart) desde la app móvil hasta **Cloudflare R2**
+- **Metadatos de sincronización** (`syncmeta`) por chunk de video (para que luego la Raspberry/worker pueda segmentar IMU)
+- (Diseño para futuro) chunks de **IMU** usando el mismo patrón (presign/PUT/confirm), que hoy aún no está implementado en la app móvil
 
-- **Cloudflare R2**: guarda los archivos (multipart upload).
-- **Firebase Firestore**: guarda metadata (sesiones, chunks, usuarios) y estados.
-- **Firebase Auth**: autentica al usuario (ID Token).
-
-> Punto clave: **los archivos nunca pasan por el backend**. El backend solo genera **presigned URLs**, valida permisos y persiste metadata.
+> Punto clave del diseño: **los binarios (chunks) nunca pasan por el backend**. El backend solo:
+> - autentica y valida permisos/estado
+> - genera **presigned URLs** para subir partes a R2
+> - persiste metadata en **Firestore**
+> - completa/aborta multipart uploads en R2 cuando corresponde
 
 ---
 
@@ -15,388 +18,405 @@ Backend en **Python + FastAPI** que coordina el streaming (por chunks) de **vide
 ```mermaid
 graph TB
   subgraph Mobile["📱 App móvil"]
-    A["Cámara + IMU"] --> B["Chunker (cada N segundos)"]
+    M1["Timer de chunks + cámara"]
+    M2["POST syncmeta por chunk"]
+    M3["POST chunks/presign (stream=video)"]
+    M4["PUT directo a R2 (chunk mp4)"]
+    M5["POST chunks/confirm (stream=video, ETag)"]
   end
 
-  subgraph Backend["⚙️ FastAPI backend"]
-    C["Auth dependency<br/>get_current_user()"] --> D["Routers<br/>/auth /sessions /uploads"]
+  subgraph Backend["⚙️ Backend FastAPI"]
+    B1["get_current_user() valida JWT Firebase"]
+    B2["/sessions crea sesión + multipart uploads"]
+    B3["/chunks/presign genera URL de upload_part (R2)"]
+    B4["/chunks/confirm persiste receipts en Firestore"]
+    B5["/sessions/{id}/complete ensambla final.mp4 + final.ndjson"]
+    B6["/syncmeta guarda metadatos por parte"]
   end
 
   subgraph Firebase["🔥 Firebase"]
-    FA["Auth: verify_id_token()"]
-    FS["Firestore: users / sessions / chunks"]
+    F1["Auth (verify_id_token)"]
+    F2["Firestore: users / sessions / chunks / syncMeta / processingQueue"]
   end
 
   subgraph R2["☁️ Cloudflare R2 (S3 compatible)"]
-    R["Multipart uploads<br/>final.mp4 + final.ndjson"]
+    R1["multipart final.mp4 y final.ndjson"]
   end
 
-  B -->|"Authorization: Bearer <Firebase ID Token>"| C
-  C -->|"verifica token"| FA
-  D -->|"lee/escribe"| FS
-  D -->|"presigned URLs / complete / abort"| R
+  M1 --> B2
+  M2 --> B6 --> F2
+  M3 --> B3 --> R2
+  M4 --> R1
+  M5 --> B4 --> F2
+  B5 --> R1
+  B1 --> F1
 ```
 
 ---
 
-## Estructura del proyecto (backend)
+## Start del backend (`app/main.py`)
 
-Carpetas/archivos importantes en `backend/app/`:
-
-- **`main.py`**: crea la app FastAPI, configura CORS, registra routers y hace `startup()` (inicializa Firebase).
-- **`config.py`**: variables de entorno centralizadas (`Settings`) + helpers para credenciales de Firebase.
-- **`dependencies.py`**: auth (extrae `Authorization: Bearer ...` y valida token).
-- **`routers/auth.py`**: endpoints de usuario/dispositivo.
-- **`routers/sessions.py`**: endpoints de creación y consulta de sesiones.
-- **`routers/uploads.py`**: endpoints de presign/confirm/complete/abort de chunks.
-- **`services/firebase.py`**: `init_firebase()`, `get_db()` (Firestore), `verify_token()` (Firebase Auth).
-- **`services/r2.py`**: wrapper boto3 para R2 (multipart + presigned).
-- **`models/*.py`**: modelos Pydantic de request/response.
-
----
-
-## Autenticación (Firebase ID Token)
-
-La app móvil autentica al usuario directamente con Firebase Auth y obtiene un **ID Token** (JWT).  
-En **cada request** al backend se manda:
-
-- **Header**: `Authorization: Bearer <idToken>`
-
-En el backend:
-
-- `app/dependencies.py:get_current_user()` usa `app/services/firebase.py:verify_token()` para validar el token.
-- Si falla: responde **401** con detalle legible (token expirado/ inválido/ error).
+- Inicializa logging con `setup_logging()` y logger de la app.
+- En el `lifespan` (startup):
+  - llama `init_firebase()` una sola vez
+- Registra routers:
+  - `/auth/*` -> `routers/auth.py`
+  - `/sessions/*` -> `routers/sessions.py`
+  - `/sessions/*` -> `routers/uploads.py` (chunks/presign/confirm/complete/abort)
+  - `/sessions/*` -> `routers/sync_signals.py` (syncmeta)
+- `CORS` está configurado con `allow_origins=["*"]`
+- Endpoint:
+  - `GET /health`
 
 ---
 
-## “Base de datos” en este backend (Firestore)
+## Autenticación: Firebase ID Token
 
-Este proyecto usa Firestore como DB de metadata (no guarda binarios). Las colecciones y sus documentos se construyen desde los routers.
+El backend usa `HTTPBearer` y `Authorization: Bearer <idToken>`.
 
-### Colección `users`
+Ruta protegida -> `get_current_user()` -> `verify_token()` con `firebase_admin.auth.verify_id_token`.
 
-**Documento**: `users/{uid}` (uid viene del token Firebase)
-
-**Se escribe/actualiza en**: `POST /auth/register-device`  
-**Se lee en**: `GET /auth/me`
-
-Campos típicos:
-
-| Campo | Tipo | Descripción |
-|------|------|-------------|
-| `uid` | string | UID de Firebase |
-| `email` | string | Email del token (si existe) |
-| `displayName` | string | Nombre del token (si existe) |
-| `deviceInfo` | object | Info del dispositivo (platform/model/os/appVersion) |
-| `createdAt` | datetime | Timestamp |
-| `updatedAt` | datetime | Timestamp |
-
-### Colección `sessions`
-
-**Documento**: `sessions/{sessionId}` (`sessionId` es UUID generado por backend)
-
-**Se crea en**: `POST /sessions`  
-**Se lista en**: `GET /sessions`  
-**Se consulta en**: `GET /sessions/{sessionId}`  
-**Se actualiza en**: `POST /sessions/{sessionId}/complete`, `DELETE /sessions/{sessionId}/abort`
-
-Campos (según `routers/sessions.py` + `models/session.py`):
-
-| Campo | Tipo | Descripción |
-|------|------|-------------|
-| `sessionId` | string | UUID |
-| `userId` | string | UID dueño |
-| `status` | string | `"recording"` → `"complete"`/`"aborted"` (y potencialmente `"uploading"`) |
-| `startedAt` | datetime | Inicio |
-| `endedAt` | datetime \| null | Fin (si terminó/abortó) |
-| `videoKey` | string | Ruta en R2 (ej. `sessions/{id}/video/final.mp4`) |
-| `imuKey` | string | Ruta en R2 (ej. `sessions/{id}/imu/final.ndjson`) |
-| `videoUpload.uploadId` | string | UploadId multipart de R2 |
-| `imuUpload.uploadId` | string | UploadId multipart de R2 |
-| `deviceInfo` | object | Metadata enviada al crear la sesión |
-| `summary` | object | Reservado para resumen/post-procesamiento |
-| `totalChunks` | int \| null | Se setea al completar |
-
-> Nota: en el modelo existe `completedParts`, pero actualmente el flujo guarda los parts confirmados en `chunks/` y reconstruye la lista al completar.
-
-### Colección `chunks`
-
-**Documento**: `chunks/{chunkId}` con `chunkId = "{sessionId}_part{NNN}"` (ej. `..._part001`)
-
-**Se crea en**: `POST /sessions/{sessionId}/chunks/confirm`  
-**Se lee (para completar) en**: `POST /sessions/{sessionId}/complete`
-
-Campos (según `routers/uploads.py` + `models/chunk.py`):
-
-| Campo | Tipo | Descripción |
-|------|------|-------------|
-| `chunkId` | string | ID compuesto (sesión + parte) |
-| `sessionId` | string | FK lógica a `sessions/{sessionId}` |
-| `partNumber` | int | Número de parte (1-based) |
-| `videoETag` | string | ETag devuelto por R2 al subir la parte de video |
-| `imuETag` | string | ETag devuelto por R2 al subir la parte IMU |
-| `uploadedAt` | datetime | Timestamp |
-| `status` | string | `"uploaded"` |
+Si el token es inválido o expiró: responde **401**.
 
 ---
 
-## Storage (Cloudflare R2) y multipart upload
+## Modelos persistidos en Firestore
 
-El backend trabaja con R2 vía `boto3` (API S3):
+### `users/{uid}`
+Creado/actualizado desde el móvil en:
+- `POST /auth/register-device`
 
-- **create**: `create_multipart_upload(key, content_type) -> uploadId`
-- **upload part**: el backend genera una **presigned URL** para `upload_part`
-- **complete**: `complete_multipart_upload(key, uploadId, parts)`
-- **abort**: `abort_multipart_upload(key, uploadId)`
-- (extra) **download**: `generate_presigned_get_url(key)`
+### `sessions/{sessionId}`
+Creado en:
+- `POST /sessions`
 
-Claves finales usadas por el backend:
+Campos importantes:
+- `status`: actualmente `"recording"` (el backend permite presign con `recording` o `uploading`, pero no hay un endpoint que setee `"uploading"` en este código)
+- `videoKey`: `sessions/{sessionId}/video/final.mp4`
+- `imuKey`: `sessions/{sessionId}/imu/final.ndjson`
+- `videoUpload.uploadId`, `imuUpload.uploadId` (IDs de multipart upload en R2)
 
-- Video: `sessions/{sessionId}/video/final.mp4`
-- IMU: `sessions/{sessionId}/imu/final.ndjson`
+### `chunks/{chunkId}`
+Creado/mergeado en:
+- `POST /sessions/{session_id}/chunks/confirm`
+
+`chunkId` = `"{sessionId}_part{partNumber:03d}"`
+
+Contiene receipts con:
+- `videoETag` / `videoStartTsUs` / `videoEndTsUs` (si stream=`video`)
+- `imuETag` / `imuStartTsUs` / `imuEndTsUs` / `sensorIds` (si stream=`imu`)
+- `status`:
+  - `"videoUploaded"` si solo llegó video
+  - `"imuUploaded"` si solo llegó imu
+  - `"readyForProcess"` cuando existen ambos receipts (video+imu) para ese `partNumber` (POC de cola)
+
+### `syncMeta/{syncId}`
+Persistido en:
+- `POST /sessions/{session_id}/syncmeta`
+
+`syncId` = `"{sessionId}_part{partNumber:03d}"`
+
+Contiene:
+- ventana temporal del video del chunk: `videoStartTsUs`, `videoEndTsUs`
+- ventana temporal del stream IMU asociada a ese chunk: `ptsStart`, `ptsEnd`
+- `nonce` (opcional, hoy el móvil no lo envía)
+- `consumedAt`, `consumedBy` (cuando la Raspberry lo consuma; hoy es POC)
+
+### `processingQueue/{chunkId}` (POC)
+Se crea cuando `confirmChunk` detecta que para ese `partNumber` ya existen receipts de:
+- `videoETag` y `imuETag`
 
 ---
 
-## Endpoints disponibles (qué hacen y qué se envía)
+## Endpoints (detalle real del código)
 
-Base URL típica: `http://localhost:8000`  
-Docs automáticas: `/docs` y `/redoc`
+### Docs / base
+- Swagger: `/docs`
+- ReDoc: `/redoc`
+- Salud: `GET /health`
 
-### Health
+---
 
-#### `GET /health`
+## Health
 
-- **Auth**: no
-- **Respuesta**:
+### `GET /health`
+Sin auth.
 
+Respuesta:
 ```json
 { "status": "ok", "env": "development" }
 ```
 
-### Auth / usuario
+---
 
-#### `POST /auth/register-device`
+## Auth
 
-- **Auth**: sí (Bearer Firebase ID Token)
-- **Body** (`RegisterDeviceRequest`):
+### `POST /auth/register-device`
+- Auth: **sí** (Bearer)
+- Body: `RegisterDeviceRequest` (con `deviceInfo` opcional)
+- Acción:
+  - upsert en `users/{uid}` con `merge=True`
+- Respuesta: `UserResponse`
 
+### `GET /auth/me`
+- Auth: **sí** (Bearer)
+- Acción: lee `users/{uid}` y retorna `UserResponse`
+
+---
+
+## Sessions
+
+### `POST /sessions`
+- Auth: **sí** (Bearer)
+- Body (`CreateSessionRequest`):
 ```json
-{
-  "deviceInfo": {
-    "platform": "android",
-    "model": "Pixel 7",
-    "osVersion": "14",
-    "appVersion": "1.0.0"
-  }
-}
+{ "deviceInfo": { "...": "..." } }
 ```
+- Acción:
+  - genera `sessionId` (UUID)
+  - abre **dos** multipart uploads en R2:
+    - video (`video/mp4`) para `sessions/{sessionId}/video/final.mp4`
+    - imu (`application/x-ndjson`) para `sessions/{sessionId}/imu/final.ndjson`
+  - crea `sessions/{sessionId}` con `status="recording"`
+- Respuesta: `SessionResponse`
 
-- **Qué hace**:
-  - Upsert en `users/{uid}` con `merge=True` (no pisa campos existentes).
-- **Respuesta** (`UserResponse`): perfil del usuario (con `deviceInfo`, timestamps, etc.).
+### `GET /sessions`
+- Auth: **sí** (Bearer)
+- Acción: lista últimas 50 sesiones del usuario (`startedAt DESC`)
 
-#### `GET /auth/me`
+### `GET /sessions/{session_id}`
+- Auth: **sí** (Bearer)
+- Acción:
+  - si no existe: **404**
+  - si no pertenece al usuario: **403**
+  - si pertenece: retorna `SessionResponse`
 
-- **Auth**: sí
-- **Qué hace**:
-  - Lee `users/{uid}` y lo devuelve; si no existe, devuelve mínimo `{uid, email}`.
-- **Respuesta** (`UserResponse`).
+---
 
-### Sessions
+## Chunks (multipart en R2)
 
-#### `POST /sessions`
+Este backend usa multipart upload en R2, pero el backend **no sube los bytes**:
+- genera presigned URL para `upload_part`
+- el móvil sube bytes con `PUT`
+- el móvil manda de vuelta el `ETag` con `chunks/confirm`
 
-- **Auth**: sí
-- **Body** (`CreateSessionRequest`):
-
+### `POST /sessions/{session_id}/chunks/presign`
+- Auth: **sí** (Bearer)
+- Body (`PresignRequest`):
 ```json
-{
-  "deviceInfo": { "any": "json" }
-}
+{ "partNumber": 1, "stream": "video" }
 ```
-
-- **Qué hace**:
-  - Genera `sessionId` (UUID).
-  - Define `videoKey` y `imuKey`.
-  - Abre **dos** multipart uploads en R2 (video e IMU) y guarda sus `uploadId`.
-  - Crea documento `sessions/{sessionId}` con `status="recording"`.
-- **Respuesta** (`SessionResponse`) con keys + uploadIds.
-
-#### `GET /sessions`
-
-- **Auth**: sí
-- **Qué hace**:
-  - Lista hasta 50 sesiones del usuario (`where userId == uid`) ordenadas por `startedAt DESC`.
-- **Respuesta**: `SessionResponse[]`.
-
-#### `GET /sessions/{session_id}`
-
-- **Auth**: sí
-- **Qué hace**:
-  - Devuelve la sesión si existe y pertenece al usuario; si no:
-    - **404** si no existe
-    - **403** si no es el dueño
-- **Respuesta**: `SessionResponse`.
-
-### Uploads / chunks
-
-#### `POST /sessions/{session_id}/chunks/presign`
-
-- **Auth**: sí
-- **Body** (`PresignRequest`):
-
-```json
-{ "partNumber": 1 }
-```
-
-- **Qué hace**:
-  - Valida que la sesión exista y sea del usuario.
-  - Verifica que `status` esté en `{ "recording", "uploading" }`.
-  - Genera 2 presigned URLs: una para **video part** y otra para **IMU part**.
-- **Respuesta** (`PresignResponse`):
-
+- Acción:
+  - valida que la sesión exista y sea del usuario
+  - verifica estado grabable: `session.status in {"recording","uploading"}`
+  - si `stream == "video"` usa:
+    - `session["videoKey"]`
+    - `session["videoUpload"]["uploadId"]`
+  - si `stream == "imu"` usa:
+    - `session["imuKey"]`
+    - `session["imuUpload"]["uploadId"]`
+  - genera presigned URL para `upload_part` con expiración **2 horas** (`ExpiresIn=7200`)
+- Respuesta (`PresignResponse`):
 ```json
 {
   "uploadId": "string",
-  "videoPresignedUrl": "https://...",
-  "imuPresignedUrl": "https://...",
-  "partNumber": 1
+  "partNumber": 1,
+  "stream": "video",
+  "presignedUrl": "https://..."
 }
 ```
 
-> Importante: el móvil sube con `PUT` directo a R2 y debe leer el header **`ETag`** de la respuesta de R2.
+### PUT del móvil a R2
+- El móvil hace `PUT` directo a `presignedUrl`.
+- Espera `ETag` en la respuesta.
+- Para video, el móvil usa `Content-Type: video/mp4`.
 
-#### `POST /sessions/{session_id}/chunks/confirm`
-
-- **Auth**: sí
-- **Body** (`ConfirmChunkRequest`):
-
+### `POST /sessions/{session_id}/chunks/confirm`
+- Auth: **sí** (Bearer)
+- Body (`ConfirmChunkRequest`):
 ```json
 {
   "partNumber": 1,
-  "videoETag": "\"etag-video\"",
-  "imuETag": "\"etag-imu\""
+  "stream": "video",
+  "etag": "\"...\"",
+  "startTsUs": 1712345678901234,
+  "endTsUs": 1712345682901234,
+  "sensorIds": null
 }
 ```
-
-- **Qué hace**:
-  - Crea/actualiza el documento `chunks/{sessionId}_partNNN` con ETags y metadata.
-- **Respuesta** (`ConfirmChunkResponse`):
-
+- Acción:
+  - arma `chunkId = {sessionId}_part{partNumber:03d}`
+  - persiste/mergea en `chunks/{chunkId}`:
+    - si stream=`video`: guarda `videoETag`, `videoStartTsUs`, `videoEndTsUs`, `videoUploadedAt`
+    - si stream=`imu`: guarda `imuETag`, `imuStartTsUs`, `imuEndTsUs`, `sensorIds`, `imuUploadedAt`
+  - calcula `status`:
+    - si tras el merge existen ambos ETags (video+imu) -> `readyForProcess` y crea `processingQueue/{chunkId}` (POC)
+    - si solo llegó video -> `videoUploaded`
+    - si solo llegó imu -> `imuUploaded`
+- Respuesta (`ConfirmChunkResponse`):
 ```json
-{ "chunkId": "session_part001", "status": "confirmed" }
+{ "chunkId": "session_part001", "status": "videoUploaded|imuUploaded|readyForProcess" }
 ```
 
-#### `POST /sessions/{session_id}/complete`
+### `GET /sessions/{session_id}/chunks`
+- Auth: **sí** (Bearer)
+- Acción: devuelve docs `chunks` de la sesión ordenados por `partNumber`
 
-- **Auth**: sí
-- **Qué hace**:
-  - Lee todos los `chunks` de esa sesión ordenados por `partNumber`.
-  - Construye `parts = [{"PartNumber": n, "ETag": "..."}]` para video e IMU.
-  - Llama `complete_multipart_upload()` para ambos objetos finales.
-  - Actualiza `sessions/{sessionId}` a:
+### `POST /sessions/{session_id}/complete`
+- Auth: **sí** (Bearer)
+- Acción:
+  - carga todos los `chunks` confirmados
+  - exige que **cada parte** tenga `videoETag` e `imuETag`
+  - llama `complete_multipart_upload()` para:
+    - `final.mp4` (usando `videoETag`)
+    - `final.ndjson` (usando `imuETag`)
+  - actualiza `sessions/{sessionId}` a:
     - `status="complete"`
     - `endedAt=now`
-    - `totalChunks=len(chunks)`
-- **Errores**:
-  - **400** si no hay chunks confirmados.
-- **Respuesta** (`CompleteSessionResponse`):
+    - `totalChunks=#chunks`
+- Error:
+  - **400** si faltan receipts (común cuando el móvil aún no sube IMU)
 
-```json
-{ "sessionId": "uuid", "status": "complete", "chunks": 12 }
-```
-
-#### `DELETE /sessions/{session_id}/abort`
-
-- **Auth**: sí
-- **Qué hace**:
-  - Aborta ambos multipart uploads (video e IMU) para no dejar partes huérfanas.
-  - Marca `sessions/{sessionId}` como `status="aborted"` y setea `endedAt`.
-- **Respuesta**:
-
-```json
-{ "status": "aborted" }
-```
+### `DELETE /sessions/{session_id}/abort`
+- Auth: **sí** (Bearer)
+- Acción:
+  - aborta ambos multipart uploads (video+imu) en R2
+  - actualiza `sessions/{sessionId}` a `status="aborted"`, `endedAt=now`
+  - recomendado al cancelar grabación
 
 ---
 
-## Flujo completo de un chunk (paso a paso)
+## SyncMeta (sincronización de chunk video -> ventana IMU)
+
+### `POST /sessions/{session_id}/syncmeta`
+- Auth: **sí** (Bearer)
+- Body (`SyncMetaRequest`):
+```json
+{
+  "partNumber": 1,
+  "videoStartTsUs": 1712345678901234,
+  "videoEndTsUs": 1712345682901234,
+  "ptsStart": 0,
+  "ptsEnd": 30000,
+  "nonce": null
+}
+```
+- Acción:
+  - guarda `syncMeta/{syncId}` con `consumedAt=None`
+- Respuesta:
+```json
+{ "syncId": "...", "status": "stored" }
+```
+
+### `GET /sessions/{session_id}/syncmeta/pending` (POC)
+- Auth: **sí** (Bearer)
+- Acción: devuelve hasta 50 `syncMeta` con `consumedAt == None` (polling)
+
+### `POST /sessions/{session_id}/syncmeta/{part_number}/consume` (POC)
+- Auth: **sí** (Bearer)
+- Acción: marca `syncMeta/{syncId}` como consumido
+
+---
+
+## Flujo completo en el móvil (lo que SÍ hace hoy)
+
+La app móvil:
+1. Crea sesión: `POST /sessions`
+2. Cada `_chunkDurationSeconds = 30`:
+   - guarda `syncmeta` con ventana del video del chunk
+   - pide `chunks/presign` para `stream:"video"`
+   - sube el chunk a R2 con `PUT` directo
+   - confirma con `chunks/confirm` (stream:"video" + `etag`)
+3. Al detener:
+   - intenta `POST /sessions/{id}/complete`
+   - puede fallar si faltan receipts de IMU (porque hoy no se suben chunks IMU desde el móvil)
+4. Al cancelar:
+   - `DELETE /sessions/{id}/abort`
 
 ```mermaid
 sequenceDiagram
-  participant M as 📱 Mobile
-  participant B as ⚙️ Backend (FastAPI)
-  participant F as 🔥 Firestore
-  participant R as ☁️ R2 (S3)
+  participant App as 📱 Mobile
+  participant API as Backend
+  participant R2 as R2
+  participant FS as Firestore
 
-  M->>B: POST /sessions/{id}/chunks/presign {partNumber}
-  B->>F: Valida sesión y dueño
-  B-->>M: {videoPresignedUrl, imuPresignedUrl}
+  App->>API: POST /sessions
+  API->>FS: sessions/{id} + crear multipart uploads en R2
+  API-->>App: sessionId
 
-  par Subida directa a R2
-    M->>R: PUT videoPresignedUrl (chunk mp4)
-    M->>R: PUT imuPresignedUrl (chunk ndjson)
+  loop chunk de video (30s)
+    App->>API: POST /sessions/{id}/syncmeta
+    API->>FS: syncMeta/{id}_partNNN
+
+    App->>API: POST /sessions/{id}/chunks/presign {partNumber, stream:"video"}
+    API->>R2: generate_presigned_url(upload_part)
+    API-->>App: presignedUrl
+
+    App->>R2: PUT presignedUrl (video/mp4)
+    R2-->>App: ETag
+
+    App->>API: POST /sessions/{id}/chunks/confirm {partNumber, stream:"video", etag, startTsUs, endTsUs}
+    API->>FS: chunks/{id}_partNNN (videoETag)
   end
 
-  R-->>M: Respuestas con headers ETag
-  M->>B: POST /sessions/{id}/chunks/confirm {partNumber, videoETag, imuETag}
-  B->>F: Escribe chunks/{id}_partNNN
-  B-->>M: {status:"confirmed"}
+  App->>API: POST /sessions/{id}/complete
+  API->>FS: valida que exista imuETag para cada part
+  API-->>App: 400 si falta IMU
+
+  alt cancelar grabación
+    App->>API: DELETE /sessions/{id}/abort
+    API->>R2: abort multipart uploads
+    API->>FS: sessions.status="aborted"
+  end
 ```
 
 ---
 
-## Estados de sesión (modelo mental)
+## Coordinación con el móvil (`lib/main.dart`, `AppShell`, `SessionScreen`)
 
-El código usa estos estados directamente:
+### `lib/main.dart`
+- Inicializa Firebase y localización.
+- Home: `LoginScreen`.
 
-- **`recording`**: sesión activa (se pueden pedir presigns).
-- **`uploading`**: permitido por backend para presign (útil si la app separa “grabación” vs “subida”).
-- **`complete`**: sesión cerrada y ensamblada en R2.
-- **`aborted`**: sesión cancelada; multipart uploads abortados.
+### `LoginScreen` / `AuthService`
+- Firma con Google (Firebase).
+- Obtiene `idToken`.
+- Llama `POST /auth/register-device` para que el backend cree/actualice `users/{uid}`.
+- Luego navega a `AppShell`.
 
-```mermaid
-stateDiagram-v2
-  [*] --> recording: POST /sessions
-  recording --> recording: presign + confirm chunks
-  recording --> complete: POST /sessions/{id}/complete
-  recording --> aborted: DELETE /sessions/{id}/abort
-  complete --> [*]
-  aborted --> [*]
-```
+### `AppShell`
+- Muestra `SessionScreen` en la barra inferior.
 
----
-
-## Configuración (Settings / .env)
-
-Variables soportadas por `app/config.py`:
-
-- **Firebase**
-  - `FIREBASE_CREDENTIALS_PATH` (dev): ruta al JSON.
-  - `FIREBASE_CREDENTIALS_B64` (prod/CI): JSON en base64; el backend lo decodifica y crea un archivo temporal para `firebase-admin`.
-- **R2**
-  - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`
-  - `R2_ENDPOINT` es opcional; si no se define y hay `R2_ACCOUNT_ID`, se construye como `https://{account_id}.r2.cloudflarestorage.com`.
-- **App**
-  - `APP_ENV` (default `development`)
-  - `CHUNK_DURATION_SECONDS` (default 30)
+### `SessionScreen` / `_RecordingRoute`
+- Al presionar iniciar:
+  - pide permisos (camera/microphone)
+  - inicializa `RecordingService`
+  - llama `POST /sessions` y obtiene `sessionId`
+  - navega a `_RecordingRoute`
+- `_RecordingRoute`:
+  - arranca grabación
+  - cada 30s rota chunks (partNumber empieza en 1)
+  - por chunk ejecuta:
+    - `POST /syncmeta`
+    - `POST /chunks/presign` (stream video)
+    - `PUT` a R2
+    - `POST /chunks/confirm` (stream video)
 
 ---
 
-## Checklist de integración móvil (mínimo)
+## Qué falta para completar el flujo “video + IMU”
 
-- **Auth**
-  - Loguear con Firebase Auth.
-  - Enviar `Authorization: Bearer <idToken>` en todas las llamadas al backend.
-- **Sesión**
-  - `POST /sessions` al empezar.
-- **Chunks**
-  - Repetir por cada chunk:
-    - `POST /sessions/{id}/chunks/presign`
-    - `PUT` video + IMU a R2 (usar las URLs)
-    - Leer `ETag` de cada `PUT`
-    - `POST /sessions/{id}/chunks/confirm`
-- **Final**
-  - `POST /sessions/{id}/complete` al terminar.
-  - Si el usuario cancela: `DELETE /sessions/{id}/abort`
+Para que `POST /sessions/{session_id}/complete` funcione:
+1. El móvil debe implementar captura de IMU y escribir chunks IMU con el mismo `partNumber` que el video.
+2. Por cada chunk IMU:
+   - `POST /sessions/{id}/chunks/presign` con `stream:"imu"`
+   - `PUT` directo a R2 usando la `presignedUrl`
+   - leer `ETag`
+   - `POST /sessions/{id}/chunks/confirm` con `stream:"imu"`, `etag`, `startTsUs`, `endTsUs` (y `sensorIds` si aplica)
+
+Cuando existan receipts de video e IMU para cada parte:
+- `confirmChunk` marcará `readyForProcess` y creará `processingQueue` (POC)
+- `completeSession` podrá ensamblar:
+  - `sessions/{id}/video/final.mp4`
+  - `sessions/{id}/imu/final.ndjson`
 

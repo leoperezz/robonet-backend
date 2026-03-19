@@ -72,11 +72,11 @@ def test_presign_chunk(mock_verify, client):
         response = client.post(
             f"/sessions/{session['sessionId']}/chunks/presign",
             headers=_auth_headers(),
-            json={"partNumber": 1},
+            json={"partNumber": 1, "stream": "video"},
         )
 
     assert response.status_code == 200
     data = response.json()
     assert data["partNumber"] == 1
-    assert "videoPresignedUrl" in data
-    assert "imuPresignedUrl" in data
+    assert data["stream"] == "video"
+    assert "presignedUrl" in data
