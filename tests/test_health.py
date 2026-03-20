@@ -7,6 +7,7 @@ def test_health_returns_ok(client):
     data = response.json()
     assert data["status"] == "ok"
     assert "env" in data
+    assert data.get("publicApiBaseUrl")
 
 
 def test_docs_available(client):

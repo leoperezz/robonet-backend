@@ -34,9 +34,19 @@ async def create_session(
     logger.info("Session created: sessionId=%s uid=%s", session_id, uid)
 
     now = datetime.now(tz=timezone.utc)
+    metadata: dict = {}
+    if body.activityType is not None:
+        metadata["activityType"] = body.activityType
+    if body.environment is not None:
+        metadata["environment"] = body.environment
+
     session_data = {
         "sessionId": session_id,
         "userId": uid,
+        "deviceId": body.deviceId,
+        "calibrationId": body.calibrationId,
+        "chunkDurationSeconds": body.chunkDurationSeconds,
+        "metadata": metadata,
         "status": "recording",
         "startedAt": now,
         "endedAt": None,

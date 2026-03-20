@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+from app.robonet_public_api_url import ROBONET_API_BASE_URL
 from app.routers import auth, sessions, uploads, sync_signals
 from app.services.firebase import init_firebase
 from app.logger import get_logger, setup_logging
@@ -30,7 +31,12 @@ def create_app() -> FastAPI:
     fastapi_app = FastAPI(
         title="Robonet Sensor Backend",
         version="0.1.0",
-        description="Backend para streaming de video e IMU a Cloudflare R2",
+        description=(
+            "Backend Robonet: sesiones, presign a R2 y receipts de chunks. "
+            "Video e IMU los captura el Soma Link; la app solo sube binarios con "
+            "URLs firmadas. Chunks IMU en NDJSON; en confirm IMU, `sensorIds` son "
+            "strings (IDs del kit, p. ej. IMU_A3F2)."
+        ),
         docs_url="/docs",
         redoc_url="/redoc",
         lifespan=lifespan,
@@ -51,7 +57,11 @@ def create_app() -> FastAPI:
 
     @fastapi_app.get("/health", tags=["health"])
     async def health() -> dict:
-        return {"status": "ok", "env": settings.app_env}
+        return {
+            "status": "ok",
+            "env": settings.app_env,
+            "publicApiBaseUrl": ROBONET_API_BASE_URL,
+        }
 
     return fastapi_app
 

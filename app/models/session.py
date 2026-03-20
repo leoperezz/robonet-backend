@@ -10,7 +10,17 @@ class MultipartUploadInfo(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
-    deviceInfo: dict[str, Any] | None = None
+    """Sesión iniciada desde la app; los binarios los sube el kit (Soma Link) vía la app."""
+
+    deviceId: str = Field(..., min_length=1, description="ID del Soma Link (MAC / serial)")
+    calibrationId: str | None = None
+    activityType: str | None = None
+    environment: Literal["indoor", "outdoor"] | None = None
+    chunkDurationSeconds: int = Field(default=30, ge=5, le=600)
+    deviceInfo: dict[str, Any] | None = Field(
+        default=None,
+        description="Metadatos del teléfono (plataforma, versión app); opcional.",
+    )
 
 
 class SessionResponse(BaseModel):
@@ -23,6 +33,10 @@ class SessionResponse(BaseModel):
     imuKey: str
     videoUpload: MultipartUploadInfo | None = None
     imuUpload: MultipartUploadInfo | None = None
+    deviceId: str | None = None
+    calibrationId: str | None = None
+    chunkDurationSeconds: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
     deviceInfo: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     totalChunks: int | None = None
@@ -52,9 +66,9 @@ class ConfirmChunkRequest(BaseModel):
         default=None,
         description="Timestamp fin (base de tiempo del origen) en microsegundos.",
     )
-    sensorIds: list[int] | None = Field(
+    sensorIds: list[str] | None = Field(
         default=None,
-        description="IDs de sensores presentes (solo para IMU).",
+        description="IDs de sensores IMU presentes en el chunk (solo stream=imu).",
     )
 
 

@@ -37,7 +37,11 @@ def _mock_session(session_id: str = "sess-abc") -> dict:
 def test_create_session(mock_verify, mock_r2, client):
     mock_db = MagicMock()
     with patch("app.routers.sessions.get_db", return_value=mock_db):
-        response = client.post("/sessions", headers=_auth_headers(), json={})
+        response = client.post(
+            "/sessions",
+            headers=_auth_headers(),
+            json={"deviceId": "soma_test_001"},
+        )
     assert response.status_code == 201
     data = response.json()
     assert data["status"] == "recording"

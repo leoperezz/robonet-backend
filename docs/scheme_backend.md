@@ -2,8 +2,8 @@
 
 Este documento describe cómo el backend FastAPI coordina:
 - **Chunks de video** (multipart) desde la app móvil hasta **Cloudflare R2**
-- **Metadatos de sincronización** (`syncmeta`) por chunk de video (para que luego la Raspberry/worker pueda segmentar IMU)
-- (Diseño para futuro) chunks de **IMU** usando el mismo patrón (presign/PUT/confirm), que hoy aún no está implementado en la app móvil
+- **Metadatos de sincronización** (`syncmeta`) por chunk de video (para alinear ventanas temporales con IMU)
+- Chunks de **IMU** (NDJSON) con el mismo patrón **presign/PUT/confirm**: la app móvil sube IMU del **teléfono** por cada `partNumber` junto al video; el kit/headset puede aportar otro origen en el futuro mezclando líneas en el mismo formato
 
 > Punto clave del diseño: **los binarios (chunks) nunca pasan por el backend**. El backend solo:
 > - autentica y valida permisos/estado
@@ -20,9 +20,9 @@ graph TB
   subgraph Mobile["📱 App móvil"]
     M1["Timer de chunks + cámara"]
     M2["POST syncmeta por chunk"]
-    M3["POST chunks/presign (stream=video)"]
-    M4["PUT directo a R2 (chunk mp4)"]
-    M5["POST chunks/confirm (stream=video, ETag)"]
+    M3["POST chunks/presign (video + imu)"]
+    M4["PUT directo a R2 (mp4 + ndjson)"]
+    M5["POST chunks/confirm (video + imu, ETag)"]
   end
 
   subgraph Backend["⚙️ Backend FastAPI"]
@@ -104,7 +104,7 @@ Creado/mergeado en:
 
 Contiene receipts con:
 - `videoETag` / `videoStartTsUs` / `videoEndTsUs` (si stream=`video`)
-- `imuETag` / `imuStartTsUs` / `imuEndTsUs` / `sensorIds` (si stream=`imu`)
+- `imuETag` / `imuStartTsUs` / `imuEndTsUs` / `sensorIds` (si stream=`imu`; ver convención `1001` más abajo)
 - `status`:
   - `"videoUploaded"` si solo llegó video
   - `"imuUploaded"` si solo llegó imu
@@ -230,6 +230,7 @@ Este backend usa multipart upload en R2, pero el backend **no sube los bytes**:
 - El móvil hace `PUT` directo a `presignedUrl`.
 - Espera `ETag` en la respuesta.
 - Para video, el móvil usa `Content-Type: video/mp4`.
+- Para IMU, el móvil usa `Content-Type: application/x-ndjson` (cuerpo = un archivo NDJSON por parte).
 
 ### `POST /sessions/{session_id}/chunks/confirm`
 - Auth: **sí** (Bearer)
@@ -244,6 +245,7 @@ Este backend usa multipart upload en R2, pero el backend **no sube los bytes**:
   "sensorIds": null
 }
 ```
+- Para `stream: "imu"`, el cuerpo es el mismo esquema; la app móvil envía típicamente `sensorIds: [1001]` para indicar **IMU integrado del teléfono** (convención documentada; otros IDs quedan para sensores del kit).
 - Acción:
   - arma `chunkId = {sessionId}_part{partNumber:03d}`
   - persiste/mergea en `chunks/{chunkId}`:
@@ -286,6 +288,44 @@ Este backend usa multipart upload en R2, pero el backend **no sube los bytes**:
 
 ---
 
+## Formato NDJSON del stream IMU (teléfono y futuros orígenes)
+
+Cada **línea** es un objeto JSON. El worker / Raspberry debe usar el campo `source` para distinguir orígenes.
+
+### Muestras del IMU del teléfono (`source: phone`)
+
+La app emite líneas por evento de sensor (timestamps en microsegundos Unix de recepción en el dispositivo):
+
+**Acelerómetro**
+```json
+{"tsUs": 1712345678901234, "source": "phone", "sensor": "accelerometer", "x": 0.0, "y": 0.0, "z": 9.8}
+```
+
+**Giroscopio**
+```json
+{"tsUs": 1712345678901235, "source": "phone", "sensor": "gyroscope", "x": 0.0, "y": 0.0, "z": 0.0}
+```
+
+**Magnetómetro** (opcional; si el dispositivo no expone el stream, puede no aparecer)
+
+```json
+{"tsUs": 1712345678901236, "source": "phone", "sensor": "magnetometer", "x": 0.0, "y": 0.0, "z": 0.0}
+```
+
+### Marcadores cuando no hay datos
+
+Si no hubo muestras en la ventana o falló el acceso a sensores, puede aparecer una línea única como:
+
+```json
+{"tsUs": 1712345678901234, "source": "phone", "note": "no_samples", "error": "mensaje opcional"}
+```
+
+### Convención `sensorIds` en Firestore
+
+- **`1001`**: IMU integrado del smartphone (valor enviado por la app al confirmar el chunk `imu`).
+
+---
+
 ## SyncMeta (sincronización de chunk video -> ventana IMU)
 
 ### `POST /sessions/{session_id}/syncmeta`
@@ -322,15 +362,14 @@ Este backend usa multipart upload en R2, pero el backend **no sube los bytes**:
 
 La app móvil:
 1. Crea sesión: `POST /sessions`
-2. Cada `_chunkDurationSeconds = 30`:
+2. Durante la grabación, captura IMU del teléfono (acelerómetro, giroscopio, magnetómetro si existe) y agrupa líneas NDJSON por chunk.
+3. Cada `_chunkDurationSeconds = 30` (y el último cierre):
    - guarda `syncmeta` con ventana del video del chunk
-   - pide `chunks/presign` para `stream:"video"`
-   - sube el chunk a R2 con `PUT` directo
-   - confirma con `chunks/confirm` (stream:"video" + `etag`)
-3. Al detener:
-   - intenta `POST /sessions/{id}/complete`
-   - puede fallar si faltan receipts de IMU (porque hoy no se suben chunks IMU desde el móvil)
-4. Al cancelar:
+   - pide `chunks/presign` para `stream:"video"` y sube el MP4; confirma video
+   - pide `chunks/presign` para `stream:"imu"`, sube el NDJSON del teléfono (`Content-Type: application/x-ndjson`); confirma IMU con `sensorIds: [1001]`
+4. Al detener:
+   - `POST /sessions/{id}/complete` cuando cada parte tiene `videoETag` e `imuETag`
+5. Al cancelar:
    - `DELETE /sessions/{id}/abort`
 
 ```mermaid
@@ -344,7 +383,7 @@ sequenceDiagram
   API->>FS: sessions/{id} + crear multipart uploads en R2
   API-->>App: sessionId
 
-  loop chunk de video (30s)
+  loop chunk de video + IMU teléfono (30s)
     App->>API: POST /sessions/{id}/syncmeta
     API->>FS: syncMeta/{id}_partNNN
 
@@ -355,13 +394,22 @@ sequenceDiagram
     App->>R2: PUT presignedUrl (video/mp4)
     R2-->>App: ETag
 
-    App->>API: POST /sessions/{id}/chunks/confirm {partNumber, stream:"video", etag, startTsUs, endTsUs}
+    App->>API: POST /sessions/{id}/chunks/confirm {partNumber, stream:"video", etag, ...}
     API->>FS: chunks/{id}_partNNN (videoETag)
+
+    App->>API: POST /sessions/{id}/chunks/presign {partNumber, stream:"imu"}
+    API-->>App: presignedUrl (imu)
+
+    App->>R2: PUT presignedUrl (application/x-ndjson)
+    R2-->>App: ETag
+
+    App->>API: POST /sessions/{id}/chunks/confirm {partNumber, stream:"imu", etag, sensorIds:[1001]}
+    API->>FS: chunks/{id}_partNNN (imuETag)
   end
 
   App->>API: POST /sessions/{id}/complete
-  API->>FS: valida que exista imuETag para cada part
-  API-->>App: 400 si falta IMU
+  API->>FS: valida videoETag + imuETag por cada part
+  API-->>App: 400 si falta algún receipt
 
   alt cancelar grabación
     App->>API: DELETE /sessions/{id}/abort
@@ -394,25 +442,20 @@ sequenceDiagram
   - llama `POST /sessions` y obtiene `sessionId`
   - navega a `_RecordingRoute`
 - `_RecordingRoute`:
-  - arranca grabación
+  - permite las cuatro orientaciones del dispositivo durante la grabación y orienta la vista previa con sensor nativo (`native_device_orientation`)
+  - arranca `PhoneImuRecorder` (streams de `sensors_plus`) y la grabación de video
   - cada 30s rota chunks (partNumber empieza en 1)
   - por chunk ejecuta:
     - `POST /syncmeta`
-    - `POST /chunks/presign` (stream video)
-    - `PUT` a R2
-    - `POST /chunks/confirm` (stream video)
+    - `POST /chunks/presign` + `PUT` + `POST /chunks/confirm` para **video** y para **imu** (NDJSON del teléfono)
 
 ---
 
-## Qué falta para completar el flujo “video + IMU”
+## Qué falta / extensiones
 
-Para que `POST /sessions/{session_id}/complete` funcione:
-1. El móvil debe implementar captura de IMU y escribir chunks IMU con el mismo `partNumber` que el video.
-2. Por cada chunk IMU:
-   - `POST /sessions/{id}/chunks/presign` con `stream:"imu"`
-   - `PUT` directo a R2 usando la `presignedUrl`
-   - leer `ETag`
-   - `POST /sessions/{id}/chunks/confirm` con `stream:"imu"`, `etag`, `startTsUs`, `endTsUs` (y `sensorIds` si aplica)
+El flujo **video + IMU desde el teléfono** ya permite completar la sesión. Posibles extensiones:
+1. **Mezclar** en el mismo NDJSON líneas del kit/headset (`source` distinto de `phone`) manteniendo un solo `partNumber` por ventana, o abrir un segundo stream R2 si se requiere aislar binarios.
+2. **Calibración** y fusión de marcas de tiempo entre reloj del teléfono y del kit (hoy `tsUs` es tiempo del dispositivo al recibir el evento).
 
 Cuando existan receipts de video e IMU para cada parte:
 - `confirmChunk` marcará `readyForProcess` y creará `processingQueue` (POC)
