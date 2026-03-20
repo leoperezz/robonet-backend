@@ -3,7 +3,7 @@ URL canónica del API REST Robonet (producción POC).
 
 Mantener alineada con:
 - `robonet-mobile-app/lib/config/api_config.dart` → `kRobonetApiBaseUrlDefault`
-- `robonet-firmware/esp32-somalink-sim/include/robonet_public_api_url.h`
+- `robonet-firmware/esp32-somalink-sim/include/robonet/robonet_public_api_url.h`
 
 En despliegues propios, cambiar los tres (o usar variables de entorno en cada capa).
 """
