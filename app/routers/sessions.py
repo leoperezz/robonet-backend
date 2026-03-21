@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.dependencies import get_current_user
 from app.models.session import CreateSessionRequest, SessionResponse
 from app.services.firebase import get_db
-from app.services.r2 import create_multipart_upload
 from app.logger import get_logger
 
 router = APIRouter()
@@ -26,11 +25,9 @@ async def create_session(
     uid: str = user["uid"]
     session_id = str(uuid.uuid4())
 
-    video_key = f"sessions/{session_id}/video/final.mp4"
-    imu_key = f"sessions/{session_id}/imu/final.ndjson"
-
-    video_upload_id = create_multipart_upload(video_key, "video/mp4")
-    imu_upload_id = create_multipart_upload(imu_key, "application/x-ndjson")
+    storage_prefix = f"sessions/{uid}/{session_id}"
+    video_prefix = f"{storage_prefix}/video"
+    imu_prefix = f"{storage_prefix}/imu"
     logger.info("Session created: sessionId=%s uid=%s", session_id, uid)
 
     now = datetime.now(tz=timezone.utc)
@@ -50,12 +47,11 @@ async def create_session(
         "status": "recording",
         "startedAt": now,
         "endedAt": None,
-        "videoKey": video_key,
-        "imuKey": imu_key,
-        "videoUpload": {"uploadId": video_upload_id, "completedParts": []},
-        "imuUpload": {"uploadId": imu_upload_id, "completedParts": []},
+        "videoPrefix": video_prefix,
+        "imuPrefix": imu_prefix,
         "deviceInfo": body.deviceInfo or {},
         "summary": {},
+        "storageLayoutVersion": 2,
     }
 
     db.collection("sessions").document(session_id).set(session_data)

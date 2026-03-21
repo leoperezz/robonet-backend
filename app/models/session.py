@@ -4,11 +4,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-class MultipartUploadInfo(BaseModel):
-    uploadId: str
-    completedParts: list[dict[str, Any]] = Field(default_factory=list)
-
-
 class CreateSessionRequest(BaseModel):
     """Sesión iniciada desde la app; los binarios los sube el kit (Soma Link) vía la app."""
 
@@ -29,10 +24,8 @@ class SessionResponse(BaseModel):
     status: str
     startedAt: datetime
     endedAt: datetime | None = None
-    videoKey: str
-    imuKey: str
-    videoUpload: MultipartUploadInfo | None = None
-    imuUpload: MultipartUploadInfo | None = None
+    videoPrefix: str
+    imuPrefix: str
     deviceId: str | None = None
     calibrationId: str | None = None
     chunkDurationSeconds: int | None = None
@@ -40,6 +33,7 @@ class SessionResponse(BaseModel):
     deviceInfo: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     totalChunks: int | None = None
+    storageLayoutVersion: int | None = None
 
 
 class PresignRequest(BaseModel):
@@ -48,10 +42,10 @@ class PresignRequest(BaseModel):
 
 
 class PresignResponse(BaseModel):
-    uploadId: str
     partNumber: int
     stream: Literal["video", "imu"]
     presignedUrl: str
+    objectKey: str | None = None
 
 
 class ConfirmChunkRequest(BaseModel):

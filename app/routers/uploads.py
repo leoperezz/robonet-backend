@@ -12,11 +12,7 @@ from app.models.session import (
     PresignResponse,
 )
 from app.services.firebase import get_db
-from app.services.r2 import (
-    abort_multipart_upload,
-    complete_multipart_upload,
-    generate_presigned_part_url,
-)
+from app.services.r2 import generate_presigned_put_url
 from app.logger import get_logger
 
 router = APIRouter()
@@ -36,6 +32,23 @@ def _get_session_or_raise(db, session_id: str, uid: str) -> dict:
     return data
 
 
+def _chunk_object_key(session: dict, stream: str, part_number: int) -> str:
+    """Construye la key R2 para el chunk (objeto por chunk)."""
+    if stream == "video":
+        prefix = session.get("videoPrefix")
+        suffix = f"part{part_number:03d}.mp4"
+    else:
+        prefix = session.get("imuPrefix")
+        suffix = f"part{part_number:03d}.ndjson"
+
+    if not prefix:
+        # Fallback defensivo si la sesión no tiene prefijos (legacy).
+        base_prefix = f"sessions/{session.get('userId')}/{session.get('sessionId')}"
+        prefix = f"{base_prefix}/{stream}"
+
+    return f"{prefix}/{suffix}"
+
+
 @router.post("/{session_id}/chunks/presign", response_model=PresignResponse)
 async def presign_chunk(
     session_id: str,
@@ -47,7 +60,7 @@ async def presign_chunk(
     El cliente hace PUT directo a R2; los datos nunca pasan por el backend.
     """
     db = get_db()
-    session = _get_session_or_raise(db, session_id, user["uid"])
+    _get_session_or_raise(db, session_id, user["uid"])
 
     if session["status"] not in _RECORDABLE_STATUSES:
         raise HTTPException(
@@ -55,14 +68,9 @@ async def presign_chunk(
             detail=f"La sesión está en estado '{session['status']}', no se puede grabar.",
         )
 
-    if body.stream == "video":
-        upload_id = session["videoUpload"]["uploadId"]
-        key = session["videoKey"]
-    else:
-        upload_id = session["imuUpload"]["uploadId"]
-        key = session["imuKey"]
-
-    presigned_url = generate_presigned_part_url(key, upload_id, body.partNumber)
+    key = _chunk_object_key(session, body.stream, body.partNumber)
+    content_type = "video/mp4" if body.stream == "video" else "application/x-ndjson"
+    presigned_url = generate_presigned_put_url(key, content_type=content_type)
     logger.info(
         "Presign chunk: sessionId=%s uid=%s stream=%s part=%s",
         session_id,
@@ -71,7 +79,12 @@ async def presign_chunk(
         body.partNumber,
     )
 
-    return PresignResponse(uploadId=upload_id, presignedUrl=presigned_url, partNumber=body.partNumber, stream=body.stream)
+    return PresignResponse(
+        presignedUrl=presigned_url,
+        partNumber=body.partNumber,
+        stream=body.stream,
+        objectKey=key,
+    )
 
 
 @router.post("/{session_id}/chunks/confirm", response_model=ConfirmChunkResponse)
@@ -87,7 +100,7 @@ async def confirm_chunk(
     cuando ambos receipts existen marca `status="readyForProcess"`.
     """
     db = get_db()
-    _get_session_or_raise(db, session_id, user["uid"])
+    session = _get_session_or_raise(db, session_id, user["uid"])
 
     chunk_id = f"{session_id}_part{body.partNumber:03d}"
     chunk_ref = db.collection("chunks").document(chunk_id)
@@ -102,6 +115,7 @@ async def confirm_chunk(
     }
 
     if body.stream == "video":
+        payload["videoKey"] = _chunk_object_key(session, "video", body.partNumber)
         payload.update(
             {
                 "videoETag": body.etag,
@@ -111,6 +125,7 @@ async def confirm_chunk(
             }
         )
     else:
+        payload["imuKey"] = _chunk_object_key(session, "imu", body.partNumber)
         payload.update(
             {
                 "imuETag": body.etag,
@@ -216,20 +231,6 @@ async def complete_session(
             detail=f"Faltan receipts antes de completar. video_missing={missing_video} imu_missing={missing_imu}",
         )
 
-    video_parts = [{"PartNumber": c["partNumber"], "ETag": c["videoETag"]} for c in chunks]
-    imu_parts = [{"PartNumber": c["partNumber"], "ETag": c["imuETag"]} for c in chunks]
-
-    complete_multipart_upload(
-        session["videoKey"],
-        session["videoUpload"]["uploadId"],
-        video_parts,
-    )
-    complete_multipart_upload(
-        session["imuKey"],
-        session["imuUpload"]["uploadId"],
-        imu_parts,
-    )
-
     db.collection("sessions").document(session_id).update(
         {
             "status": "complete",
@@ -256,10 +257,7 @@ async def abort_session(
     Siempre llamar esto cuando el usuario cancela una grabación para liberar storage.
     """
     db = get_db()
-    session = _get_session_or_raise(db, session_id, user["uid"])
-
-    abort_multipart_upload(session["videoKey"], session["videoUpload"]["uploadId"])
-    abort_multipart_upload(session["imuKey"], session["imuUpload"]["uploadId"])
+    _get_session_or_raise(db, session_id, user["uid"])
     logger.info("Session aborted: sessionId=%s uid=%s", session_id, user["uid"])
 
     db.collection("sessions").document(session_id).update(

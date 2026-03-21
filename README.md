@@ -126,12 +126,12 @@ Estructura esperada del backend (simplificada):
      - `Access Key ID`
      - `Secret Access Key`
 
-**Layout de objetos recomendado**
+**Layout de objetos recomendado (por chunk)**
 
-- `sessions/{sessionId}/video/final.mp4` → objeto ensamblado a partir de los chunks.
-- `sessions/{sessionId}/imu/final.ndjson` → objeto ensamblado a partir de los chunks IMU.
+- `sessions/{userId}/{sessionId}/video/partNNN.mp4` → cada chunk de video (30s).
+- `sessions/{userId}/{sessionId}/imu/partNNN.ndjson` → cada chunk IMU (30s).
 
-Los chunks intermedios (partes) son manejados por el propio mecanismo de **multipart upload** a través de los `ETag` y no necesariamente quedan como archivos individuales visibles.
+R2 es object storage: los “directorios” son prefijos del key. En la UI se ven como carpetas cuando se navega por prefijo.
 
 **Variables relevantes**
 

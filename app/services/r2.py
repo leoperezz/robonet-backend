@@ -73,6 +73,24 @@ def generate_presigned_part_url(key: str, upload_id: str, part_number: int) -> s
     return url
 
 
+def generate_presigned_put_url(key: str, content_type: str | None = None, expires_in: int = 7200) -> str:
+    """
+    Genera una presigned URL para PUT directo de un objeto (chunk completo).
+    Válida por defecto 2 horas.
+    """
+    client = get_r2_client()
+    settings = get_settings()
+    params: dict[str, Any] = {"Bucket": settings.r2_bucket_name, "Key": key}
+    if content_type:
+        params["ContentType"] = content_type
+    url: str = client.generate_presigned_url(
+        "put_object",
+        Params=params,
+        ExpiresIn=expires_in,
+    )
+    return url
+
+
 def complete_multipart_upload(key: str, upload_id: str, parts: list[dict]) -> str:
     """
     Completa el multipart upload ensamblando todas las partes en el objeto final.

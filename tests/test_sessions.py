@@ -23,18 +23,16 @@ def _mock_session(session_id: str = "sess-abc") -> dict:
         "status": "recording",
         "startedAt": datetime.now(tz=timezone.utc),
         "endedAt": None,
-        "videoKey": f"sessions/{session_id}/video/final.mp4",
-        "imuKey": f"sessions/{session_id}/imu/final.ndjson",
-        "videoUpload": {"uploadId": "vid-upload-id", "completedParts": []},
-        "imuUpload": {"uploadId": "imu-upload-id", "completedParts": []},
+        "videoPrefix": f"sessions/{FAKE_USER['uid']}/{session_id}/video",
+        "imuPrefix": f"sessions/{FAKE_USER['uid']}/{session_id}/imu",
         "deviceInfo": {},
         "summary": {},
+        "storageLayoutVersion": 2,
     }
 
 
-@patch("app.routers.sessions.create_multipart_upload", return_value="upload-id-123")
 @patch("app.services.firebase.verify_token", return_value=FAKE_USER)
-def test_create_session(mock_verify, mock_r2, client):
+def test_create_session(mock_verify, client):
     mock_db = MagicMock()
     with patch("app.routers.sessions.get_db", return_value=mock_db):
         response = client.post(
@@ -70,7 +68,7 @@ def test_presign_chunk(mock_verify, client):
     mock_db.collection.return_value.document.return_value.get.return_value = mock_doc
 
     with patch("app.routers.uploads.get_db", return_value=mock_db), patch(
-        "app.routers.uploads.generate_presigned_part_url",
+        "app.routers.uploads.generate_presigned_put_url",
         return_value="https://r2.example.com/presigned",
     ):
         response = client.post(
