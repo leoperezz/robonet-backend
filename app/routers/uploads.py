@@ -60,7 +60,7 @@ async def presign_chunk(
     El cliente hace PUT directo a R2; los datos nunca pasan por el backend.
     """
     db = get_db()
-    _get_session_or_raise(db, session_id, user["uid"])
+    session = _get_session_or_raise(db, session_id, user["uid"])
 
     if session["status"] not in _RECORDABLE_STATUSES:
         raise HTTPException(
